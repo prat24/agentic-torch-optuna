@@ -1,4 +1,4 @@
-# Simple Demo Agentic AutoML MCP
+# Simple Agentic Demo: AutoML using Optuna and PyTorch Lightning MCP
 
 An **agentic demo** where an LLM autonomously calls Optuna and PyTorch Lightning MCP tools to perform simple training and hyperparameter optimization. The LLM decides which tools to call, with what parameters, and when to stop.
 
