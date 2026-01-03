@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "automl-agent"
+version = "0.1.0"
+description = "Agentic MCP demo - LLM autonomously calls Optuna and Lightning MCP tools"
+requires-python = ">=3.12"
+dependencies = [
+    "mcp>=1.0.0",
+    "openai>=1.0.0",
+    "python-dotenv>=1.0.0",
+    "optuna-mcp>=0.2.0",
+    "lightning-mcp>=0.1.0",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.1.0",
+]
+[tool.hatch.build.targets.wheel]
+packages = ["."]
