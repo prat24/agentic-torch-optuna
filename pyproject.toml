@@ -3,16 +3,18 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "automl-agent"
+name = "agentic-demo"
 version = "0.1.0"
-description = "Agentic MCP demo - LLM autonomously calls Optuna and Lightning MCP tools"
+description = "Agentic MCP demo - LLM autonomously calls Optuna and Lightning MCP tools for AutoML."
 requires-python = ">=3.12"
 dependencies = [
     "mcp>=1.0.0",
     "openai>=1.0.0",
     "python-dotenv>=1.0.0",
     "optuna-mcp>=0.2.0",
-    "lightning-mcp>=0.1.0",
+    "lightning-mcp>=0.5.0",
+    "pytorch-lightning>=2.2",
+    "torch>=2.1",
 ]
 
 [dependency-groups]

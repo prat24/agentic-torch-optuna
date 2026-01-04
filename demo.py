@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """
-Demonstrates an LLM agent that autonomously calls MCP tools to perform
-hyperparameter optimization. The agent discovers available tools from
-Optuna MCP and Lightning MCP, decides which tools to call, and when to stop.
+Agentic AutoML Demo - LLM autonomously calls MCP tools for hyperparameter
+optimization with full ML workflow: train, validate, test, and checkpoint.
 
 Usage:
     uv run python demo.py
 
 Requirements:
     - OPENAI_API_KEY in .env file
-    - optuna-mcp and lightning-mcp (installed via uvx at runtime)
+    - optuna-mcp and lightning-mcp>=0.5.0 (installed via uvx at runtime)
 """
 
 from __future__ import annotations
@@ -19,6 +18,7 @@ import json
 import logging
 import os
 import time
+from dataclasses import dataclass
 from typing import Any
 
 from dotenv import load_dotenv
@@ -27,17 +27,26 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 from openai import OpenAI
 
 # Configuration
-MODEL = "gpt-4o"
-MAX_ITERATIONS = 25
-RATE_LIMIT_RETRY_DELAY = 10
+MODEL = "gpt-4o-mini"
+MAX_ITERATIONS = 30
+RATE_LIMIT_RETRY_DELAY = 3
 
 # Setup
 load_dotenv()
 logging.basicConfig(level=logging.WARNING)
 
 
+@dataclass
+class MCPConnection:
+    """Holds MCP session and metadata."""
+
+    session: ClientSession
+    prefix: str
+    tools: list[Any]
+
+
 def get_openai_client() -> OpenAI:
-    """Create and return an OpenAI client using the API key from the environment."""
+    """Create OpenAI client from environment."""
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise ValueError("OPENAI_API_KEY not found in .env file")
@@ -56,105 +65,68 @@ def extract_result(call_result: Any) -> dict[str, Any] | str:
     return {}
 
 
-# Tool description templates
-OPTUNA_ASK_DESC = """Get next hyperparameter suggestions from Optuna.
-REQUIRED: search_space parameter.
+def mcp_tool_to_openai_function(tool: Any, prefix: str) -> dict[str, Any]:
+    """Convert a single MCP tool to OpenAI function format."""
+    # Strip prefix from tool name if present (e.g., lightning.train -> train)
+    tool_name = tool.name
+    if tool_name.startswith(f"{prefix}."):
+        tool_name = tool_name[len(prefix) + 1 :]
 
-Example:
-{"search_space": {
-  "input_dim": {"name": "IntDistribution", "attributes": {"low": 4, "high": 16}},
-  "num_classes": {"name": "IntDistribution", "attributes": {"low": 2, "high": 5}},
-  "lr": {"name": "FloatDistribution", "attributes": {"low": 0.001, "high": 0.1, "log": true}}
-}}"""
+    # Normalize: replace dots with underscores for OpenAI compatibility
+    normalized_name = tool_name.replace(".", "_")
+    full_name = f"{prefix}_{normalized_name}"
 
-LIGHTNING_TRAIN_DESC = """Train a PyTorch Lightning model.
-REQUIRED: model and trainer configs.
+    description = tool.description or f"{prefix} tool: {tool.name}"
 
-Example:
-{"model": {
-  "_target_": "lightning_mcp.models.simple.SimpleClassifier",
-  "input_dim": 10,
-  "num_classes": 3,
-  "lr": 0.01
-},
-"trainer": {
-  "max_epochs": 5,
-  "accelerator": "cpu",
-  "enable_progress_bar": false,
-  "enable_model_summary": false
-}}"""
+    # Add examples for tools that need them (helps smaller models)
+    if tool.name == "ask":
+        description = 'Get next hyperparameter suggestions. The search_space parameter defines the hyperparameter distributions to sample from.'
+
+    return {
+        "type": "function",
+        "function": {
+            "name": full_name,
+            "description": description,
+            "parameters": tool.inputSchema or {"type": "object", "properties": {}},
+        },
+    }
 
 
-def mcp_tools_to_openai_tools(optuna_tools: list, lightning_tools: list) -> list[dict]:
-    """Convert MCP tool schemas into OpenAI function-calling format."""
+def build_openai_tools(connections: list[MCPConnection]) -> list[dict[str, Any]]:
+    """Build OpenAI tools from all MCP connections plus finish sentinel."""
     openai_tools = []
 
-    # Optuna tools
-    for tool in optuna_tools:
-        schema = tool.inputSchema or {"type": "object", "properties": {}}
-        desc = (
-            OPTUNA_ASK_DESC
-            if tool.name == "ask"
-            else (tool.description[:500] if tool.description else "Optuna tool")
-        )
+    for conn in connections:
+        for tool in conn.tools:
+            openai_tools.append(mcp_tool_to_openai_function(tool, conn.prefix))
 
-        openai_tools.append({
-            "type": "function",
-            "function": {
-                "name": f"optuna_{tool.name}",
-                "description": desc,
-                "parameters": schema,
-            },
-        })
-
-    # Lightning tools
-    for tool in lightning_tools:
-        name = tool.name.replace(".", "_")  # OpenAI function names cannot contain dots
-        schema = tool.inputSchema or {"type": "object", "properties": {}}
-        desc = (
-            LIGHTNING_TRAIN_DESC
-            if "train" in tool.name
-            else (tool.description[:500] if tool.description else "Lightning tool")
-        )
-
-        openai_tools.append({
-            "type": "function",
-            "function": {
-                "name": f"lightning_{name}",
-                "description": desc,
-                "parameters": schema,
-            },
-        })
-
-    # Sentinel tool to end optimization
+    # Sentinel tool to signal completion
     openai_tools.append({
         "type": "function",
         "function": {
             "name": "finish_optimization",
-            "description": "Signal completion of optimization. MUST include best_params.",
+            "description": "Signal that the optimization workflow is complete. Call this after testing the best model.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "summary": {
                         "type": "string",
-                        "description": "Summary of optimization results",
+                        "description": "Summary of the optimization process and results",
                     },
                     "best_params": {
                         "type": "object",
-                        "description": "Best hyperparameters",
-                        "properties": {
-                            "input_dim": {"type": "integer"},
-                            "num_classes": {"type": "integer"},
-                            "lr": {"type": "number"},
-                        },
-                        "required": ["input_dim", "num_classes", "lr"],
+                        "description": "The best hyperparameters found",
                     },
-                    "best_loss": {
-                        "type": "number",
-                        "description": "Best training loss achieved",
+                    "best_metrics": {
+                        "type": "object",
+                        "description": "Metrics from the best trial (train_loss, val_loss, test_loss, etc.)",
+                    },
+                    "checkpoint_path": {
+                        "type": "string",
+                        "description": "Path to the saved checkpoint of the best model (if saved)",
                     },
                 },
-                "required": ["summary", "best_params", "best_loss"],
+                "required": ["summary", "best_params", "best_metrics"],
             },
         },
     })
@@ -165,143 +137,105 @@ def mcp_tools_to_openai_tools(optuna_tools: list, lightning_tools: list) -> list
 async def execute_tool(
     tool_name: str,
     args: dict[str, Any],
-    optuna_sess: ClientSession,
-    lightning_sess: ClientSession,
+    connections: dict[str, MCPConnection],
 ) -> str:
-    """Execute an MCP tool and return the result as a JSON string."""
+    """Route and execute a tool call to the appropriate MCP server."""
     if tool_name == "finish_optimization":
         return json.dumps({"status": "optimization_complete", **args})
 
-    if tool_name.startswith("optuna_"):
-        mcp_tool_name = tool_name.removeprefix("optuna_")
-        result = await optuna_sess.call_tool(mcp_tool_name, args)
-        return json.dumps(extract_result(result))
+    # Find the matching connection by prefix
+    for prefix, conn in connections.items():
+        if tool_name.startswith(f"{prefix}_"):
+            # Convert back to MCP tool name
+            # lightning_train -> lightning.train
+            # optuna_create_study -> create_study
+            suffix = tool_name.removeprefix(f"{prefix}_")
+            if prefix == "lightning":
+                # Lightning tools: train -> lightning.train
+                mcp_tool_name = f"lightning.{suffix}"
+            else:
+                # Optuna tools use underscores as-is
+                mcp_tool_name = suffix
 
-    if tool_name.startswith("lightning_"):
-        mcp_tool_name = tool_name.removeprefix("lightning_").replace("_", ".")
-        result = await lightning_sess.call_tool(mcp_tool_name, args)
-        return json.dumps(extract_result(result))
+            try:
+                result = await conn.session.call_tool(mcp_tool_name, args)
+                return json.dumps(extract_result(result))
+            except Exception as e:
+                return json.dumps({"error": str(e), "tool": mcp_tool_name, "args": args})
 
     return json.dumps({"error": f"Unknown tool: {tool_name}"})
 
 
-# System prompt that defines agent behavior
-SYSTEM_PROMPT = """You are an AutoML agent that optimizes hyperparameters using MCP tools.
+# System prompt - truly agentic, tool-driven
+SYSTEM_PROMPT = """You are an AutoML agent with access to Optuna (hyperparameter optimization) and Lightning (ML training) tools.
 
-You have access to:
-1. Optuna MCP tools (optuna_*)
-2. Lightning MCP tools (lightning_*)
+YOUR GOAL: Find the best hyperparameters for a neural network classifier, then save and test it.
 
-Task (follow exactly, in order):
-1. Create an Optuna study: optuna_create_study(study_name="automl", directions=["minimize"])
-2. Run EXACTLY 3 training trials:
-   a) Call optuna_ask with search_space
-   b) Call lightning_lightning_train
-   c) Call optuna_tell with train_loss
-3. Call optuna_best_trial
-4. Immediately call finish_optimization
+AVAILABLE TOOLS:
+- optuna_create_study: Create an optimization study
+- optuna_ask: Sample hyperparameters from a search space  
+- optuna_tell: Report the objective value for a trial
+- optuna_best_trial: Get the best trial's parameters
+- lightning_train: Train a model
+- lightning_validate: Validate a trained model (gets val_loss)
+- lightning_test: Test a trained model (gets test metrics)
+- lightning_checkpoint: Save/load model checkpoints
+- finish_optimization: Call when done
 
-For lightning_lightning_train:
-{"model": {"_target_": "lightning_mcp.models.simple.SimpleClassifier",
-           "input_dim": <int>, "num_classes": <int>, "lr": <float>},
- "trainer": {"max_epochs": 5, "accelerator": "cpu",
-             "enable_progress_bar": false, "enable_model_summary": false}}
+MODEL TO OPTIMIZE: model.DemoClassifier
+- Required params: input_dim (int), num_classes (int), lr (float)
+- Use _target_: "model.DemoClassifier" in model config
 
-For optuna_ask:
-{"search_space": {"input_dim": {"name": "IntDistribution", "attributes": {"low": 4, "high": 16}},
-                  "num_classes": {"name": "IntDistribution", "attributes": {"low": 2, "high": 5}},
-                  "lr": {"name": "FloatDistribution", "attributes": {"low": 0.001, "high": 0.1, "log": true}}}}
+SEARCH SPACE FORMAT (for optuna_ask):
+{
+  "param_name": {
+    "name": "IntDistribution" | "FloatDistribution",
+    "attributes": {"low": X, "high": Y, "log": true/false}
+  }
+}
 
-Call tools one at a time and count trials carefully."""
+TRAINER CONFIG:
+{"max_epochs": 5, "accelerator": "cpu", "enable_progress_bar": false, "enable_model_summary": false}
 
+WORKFLOW PATTERN:
+1. Create study (minimize val_loss)
+2. For each trial: ask → train → validate → tell (with val_loss from validate)
+3. After trials: get best_trial → train best → checkpoint → test → finish
 
-async def main() -> None:
-    """Run the agentic AutoML demo."""
-    print("\n" + "=" * 70)
-    print("AGENTIC AUTOML DEMO - LLM Tool Calling")
-    print("=" * 70)
-    print("\nThe LLM agent will autonomously:")
-    print("   - Discover MCP tools")
-    print("   - Decide which tools to call")
-    print("   - Run hyperparameter optimization")
-    print("   - Analyze results and iterate")
-    print("=" * 70 + "\n")
-
-    client = get_openai_client()
-
-    # MCP server configs
-    optuna_params = StdioServerParameters(command="uvx", args=["optuna-mcp"])
-    lightning_params = StdioServerParameters(command="uvx", args=["lightning-mcp"])
-
-    print("Connecting to MCP servers...")
-
-    async with stdio_client(optuna_params) as optuna_io:
-        async with ClientSession(optuna_io[0], optuna_io[1]) as optuna_sess:
-            await optuna_sess.initialize()
-            print("Connected to Optuna MCP")
-
-            async with stdio_client(lightning_params) as lightning_io:
-                async with ClientSession(lightning_io[0], lightning_io[1]) as lightning_sess:
-                    await lightning_sess.initialize()
-                    print("Connected to Lightning MCP")
-
-                    # Discover tools
-                    optuna_tools_list = await optuna_sess.list_tools()
-                    lightning_tools_list = await lightning_sess.list_tools()
-
-                    print("\nAvailable tools:")
-                    print(f"Optuna MCP: {len(optuna_tools_list.tools)}")
-                    print(f"Lightning MCP: {len(lightning_tools_list.tools)}")
-
-                    openai_tools = mcp_tools_to_openai_tools(
-                        optuna_tools_list.tools,
-                        lightning_tools_list.tools,
-                    )
-
-                    messages = [
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {
-                            "role": "user",
-                            "content": "Run hyperparameter optimization for a classifier.",
-                        },
-                    ]
-
-                    print("\n" + "=" * 70)
-                    print("AGENT STARTING")
-                    print("=" * 70)
-
-                    await run_agent_loop(
-                        client=client,
-                        messages=messages,
-                        openai_tools=openai_tools,
-                        optuna_sess=optuna_sess,
-                        lightning_sess=lightning_sess,
-                    )
+RULES:
+- ONE tool call per turn
+- Read ACTUAL values from tool responses, don't assume
+- Use val_loss from lightning_validate result for optuna_tell
+- trial_number comes from optuna_ask response"""
 
 
 async def run_agent_loop(
     client: OpenAI,
     messages: list[dict],
     openai_tools: list[dict],
-    optuna_sess: ClientSession,
-    lightning_sess: ClientSession,
-) -> None:
+    connections: dict[str, MCPConnection],
+) -> dict[str, Any] | None:
     """Run the agent loop until completion or max iterations."""
     for iteration in range(MAX_ITERATIONS):
-        response = await call_llm_with_retry(client, messages, openai_tools)
+        response = call_llm_with_retry(client, messages, openai_tools)
         assistant_message = response.choices[0].message
         messages.append(assistant_message)
 
         if assistant_message.tool_calls:
             for tool_call in assistant_message.tool_calls:
                 tool_name = tool_call.function.name
-                tool_args = json.loads(tool_call.function.arguments) if tool_call.function.arguments else {}
+                tool_args = (
+                    json.loads(tool_call.function.arguments)
+                    if tool_call.function.arguments
+                    else {}
+                )
 
-                print(f"\nAgent calls: {tool_name}")
-                print(f"   Args: {json.dumps(tool_args, indent=2)[:200]}")
+                print(f"\n[{iteration + 1}] {tool_name}")
+                print(f"    Args: {json.dumps(tool_args, indent=2)[:300]}")
 
-                result = await execute_tool(tool_name, tool_args, optuna_sess, lightning_sess)
-                print(f"   Result: {result[:300]}...")
+                result = await execute_tool(tool_name, tool_args, connections)
+                result_preview = result[:400] + "..." if len(result) > 400 else result
+                print(f"    Result: {result_preview}")
 
                 messages.append({
                     "role": "tool",
@@ -310,45 +244,144 @@ async def run_agent_loop(
                 })
 
                 if tool_name == "finish_optimization":
-                    print_final_results(json.loads(result))
-                    return
+                    return json.loads(result)
 
         elif assistant_message.content:
-            print(f"\nAgent: {assistant_message.content[:200]}...")
+            print(f"\nAgent: {assistant_message.content[:300]}...")
 
+        # Check for natural stop without finish
         if response.choices[0].finish_reason == "stop" and not assistant_message.tool_calls:
-            print("\nAgent stopped without calling finish_optimization")
-            return
+            print("\n⚠️  Agent stopped without calling finish_optimization")
+            return None
 
-    print(f"\nReached max iterations ({MAX_ITERATIONS})")
+    print(f"\n⚠️  Reached max iterations ({MAX_ITERATIONS})")
+    return None
 
 
-async def call_llm_with_retry(client: OpenAI, messages: list[dict], tools: list[dict]):
-    """Call the LLM with basic retry logic for rate limits."""
-    for attempt in range(3):
+def call_llm_with_retry(
+    client: OpenAI, messages: list[dict], tools: list[dict], max_retries: int = 3
+) -> Any:
+    """Call the LLM with retry logic for rate limits."""
+    for attempt in range(max_retries):
         try:
             return client.chat.completions.create(
                 model=MODEL,
                 messages=messages,
                 tools=tools,
                 tool_choice="auto",
-                temperature=0.3,
+                temperature=0.2,
             )
         except Exception as e:
-            if "rate_limit" in str(e).lower() and attempt < 2:
+            if "rate_limit" in str(e).lower() and attempt < max_retries - 1:
                 print(f"Rate limited, waiting {RATE_LIMIT_RETRY_DELAY}s...")
                 time.sleep(RATE_LIMIT_RETRY_DELAY)
             else:
                 raise
 
 
-def print_final_results(result: dict) -> None:
+def print_banner() -> None:
+    """Print startup banner."""
+    print("\n" + "=" * 70)
+    print("AGENTIC AUTOML DEMO")
+    print("=" * 70)
+    print("\nWorkflow: Optimize → Train → Validate → Checkpoint → Test")
+    print("\nThe agent will autonomously:")
+    print("  • Discover available MCP tools")
+    print("  • Run hyperparameter optimization trials")
+    print("  • Validate model during optimization")
+    print("  • Save checkpoint of best model")
+    print("  • Run final test evaluation")
+    print("=" * 70)
+
+
+def print_results(result: dict[str, Any]) -> None:
     """Print final optimization results."""
-    print("AGENT FINISHED OPTIMIZATION")
-    print(f"\n{result.get('summary', 'No summary')}")
-    print(f"\nBest params: {result.get('best_params', {})}")
-    print(f"Best loss: {result.get('best_loss', 'N/A')}")
-    print("\n" + "=" * 70 + "\n")
+    print("\n" + "=" * 70)
+    print("OPTIMIZATION COMPLETE")
+    print("=" * 70)
+    print(f"\n{result.get('summary', 'No summary provided')}")
+    print(f"\nBest Parameters: {json.dumps(result.get('best_params', {}), indent=2)}")
+    print(f"\nMetrics: {json.dumps(result.get('best_metrics', {}), indent=2)}")
+    if result.get("checkpoint_path"):
+        print(f"\nCheckpoint: {result.get('checkpoint_path')}")
+    print("\n" + "=" * 70)
+
+
+async def main() -> None:
+    """Run the agentic AutoML demo."""
+    print_banner()
+
+    client = get_openai_client()
+
+    # MCP server configurations
+    # Optuna: use uvx (isolated env is fine)
+    optuna_params = StdioServerParameters(command="uvx", args=["optuna-mcp"])
+    # Lightning: run via CLI entry point which properly redirects stderr
+    # Use local venv so it can import our model.py
+    lightning_params = StdioServerParameters(
+        command="uv",
+        args=["run", "lightning-mcp"],
+    )
+
+    print("\nConnecting to MCP servers...")
+
+    async with stdio_client(optuna_params) as optuna_io:
+        async with ClientSession(optuna_io[0], optuna_io[1]) as optuna_sess:
+            await optuna_sess.initialize()
+            optuna_tools = await optuna_sess.list_tools()
+            print(f"✓ Optuna MCP: {len(optuna_tools.tools)} tools")
+
+            async with stdio_client(lightning_params) as lightning_io:
+                async with ClientSession(lightning_io[0], lightning_io[1]) as lightning_sess:
+                    await lightning_sess.initialize()
+                    lightning_tools = await lightning_sess.list_tools()
+                    print(f"✓ Lightning MCP: {len(lightning_tools.tools)} tools")
+
+                    # List discovered tools
+                    print("\nLightning tools available:")
+                    for tool in lightning_tools.tools:
+                        print(f"  • {tool.name}: {tool.description[:60]}...")
+
+                    # Build connections map
+                    connections = {
+                        "optuna": MCPConnection(
+                            session=optuna_sess,
+                            prefix="optuna",
+                            tools=optuna_tools.tools,
+                        ),
+                        "lightning": MCPConnection(
+                            session=lightning_sess,
+                            prefix="lightning",
+                            tools=lightning_tools.tools,
+                        ),
+                    }
+
+                    # Build OpenAI tools from discovered MCP tools
+                    openai_tools = build_openai_tools(list(connections.values()))
+
+                    messages = [
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {
+                            "role": "user",
+                            "content": "Optimize hyperparameters for DemoClassifier using 3 trials. Search space: input_dim (4-16), num_classes (2-5), lr (0.001-0.1 log scale). After finding the best config, save a checkpoint and run test evaluation. Report final results.",
+                        },
+                    ]
+
+                    print("\n" + "=" * 70)
+                    print("AGENT STARTING")
+                    print("=" * 70)
+
+                    result = await run_agent_loop(
+                        client=client,
+                        messages=messages,
+                        openai_tools=openai_tools,
+                        connections=connections,
+                    )
+
+                    if result:
+                        print_results(result)
+                    else:
+                        print("\n❌ Optimization did not complete successfully")
 
 
 if __name__ == "__main__":

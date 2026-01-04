@@ -26,4 +26,5 @@ htmlcov/
 # Output
 outputs/
 lightning_logs/
+checkpoints/
 *.log

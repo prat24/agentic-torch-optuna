@@ -1,6 +1,6 @@
 # Simple Agentic Demo: AutoML using Optuna and PyTorch Lightning MCP
 
-An **agentic demo** where an LLM autonomously calls Optuna and PyTorch Lightning MCP tools to perform simple training and hyperparameter optimization. The LLM decides which tools to call, with what parameters, and when to stop.
+An **agentic demo** where an LLM (gpt-4o-mini) autonomously calls Optuna and PyTorch Lightning MCP tools to perform simple training and hyperparameter optimization. The LLM decides which tools to call, with what parameters, and when to stop.
 
 ## Features
 
@@ -34,18 +34,16 @@ uv run python demo.py
 3. **Agent Loop**
 
    - LLM receives available tools and task description
-   - LLM calls `optuna_create_study` to start
-   - LLM calls `optuna_ask` → `lightning_lightning_train` → `optuna_tell` for each trial
-   - LLM calls `optuna_best_trial` to get results
-   - LLM calls `finish_optimization` when done
+   - LLM autonomously calls available tools to optimize, train, validate, checkpoint, and test models as needed
 
 ## Project Structure
 
 ```
-automl-agent/
-├── demo.py          # Main agentic demo
-├── pyproject.toml   # Dependencies
-├── .env             # OpenAI API key (create this)
+agentic-demo/
+├── demo.py        # Main agentic demo
+├── model.py       # Custom Lightning model
+├── pyproject.toml # Dependencies
+├── .env           # OpenAI API key (create this)
 └── README.md
 ```
 
