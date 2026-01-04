@@ -4,7 +4,8 @@ An **agentic demo** where an LLM (gpt-4o-mini) autonomously calls Optuna and PyT
 
 ## Features
 
-**LLM Tool Calling**: LLM autonomously calls tools via OpenAI function calling
+**LLM Tool Calling**: LLM autonomously calls tools via OpenAI function calling.
+
 **Optuna MCP**: Hyperparameter suggestion, tracking, and analysis (from PyPI)
 **Lightning MCP**: Real PyTorch model training (from PyPI)
 
